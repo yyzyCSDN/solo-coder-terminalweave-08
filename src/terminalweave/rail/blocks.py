@@ -55,23 +55,49 @@ class RailBlockPlanner:
             raise ValidationError('duplicate wagon id')
         self.loads = [WagonLoad(w) for w in wagons]
 
+    def _loaded_index(self) -> dict[str, tuple[int, RailContainer]]:
+        index = {}
+        for position, load in enumerate(self.loads):
+            for container in load.containers:
+                index[container.container_id] = (position, container)
+        return index
+
     def assign(self, containers: list[RailContainer]) -> dict[str, str]:
         if len({c.container_id for c in containers}) != len(containers):
             raise ValidationError('duplicate container id')
         ordered = sorted(containers, key=lambda c: (-c.priority, -c.weight_kg, -c.length_ft, c.container_id))
+        already_loaded = self._loaded_index()
+        # Plan the whole batch against a scratch copy so weight, length and
+        # destination constraints are judged together: a failure anywhere
+        # leaves the current loads untouched.
+        planned = [WagonLoad(load.wagon, list(load.containers)) for load in self.loads]
+        additions = []
         assignments = {}
         for container in ordered:
-            candidates = [load for load in self.loads if load.can_add(container)]
+            prior = already_loaded.get(container.container_id)
+            if prior is not None:
+                position, existing = prior
+                if existing != container:
+                    raise ConflictError(f'container {container.container_id} already loaded with different attributes')
+                # Idempotent replay: keep the original placement, never load twice.
+                assignments[container.container_id] = planned[position].wagon.wagon_id
+                continue
+            candidates = [(position, load) for position, load in enumerate(planned) if load.can_add(container)]
             if not candidates:
                 raise CapacityError(f'no wagon capacity for {container.container_id}')
 
-            def waste(load: WagonLoad):
+            def waste(entry):
+                _, load = entry
                 weight_left = load.wagon.max_weight_kg - (load.used_weight_kg + container.weight_kg)
                 length_left = load.wagon.slot_equivalent_ft - (load.used_length_ft + container.length_ft)
                 return (length_left, weight_left, load.wagon.wagon_id)
-            chosen = min(candidates, key=waste)
-            chosen.add(container)
+            position, chosen = min(candidates, key=waste)
+            chosen.containers.append(container)
+            additions.append((position, container))
             assignments[container.container_id] = chosen.wagon.wagon_id
+        # Commit only after the whole batch was planned successfully.
+        for position, container in additions:
+            self.loads[position].containers.append(container)
         return assignments
 
     def validate_sequence(self, destination_order: list[str]) -> None:
