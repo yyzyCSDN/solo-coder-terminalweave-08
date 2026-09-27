@@ -58,10 +58,26 @@ class RailBlockPlanner:
     def assign(self, containers: list[RailContainer]) -> dict[str, str]:
         if len({c.container_id for c in containers}) != len(containers):
             raise ValidationError('duplicate container id')
-        ordered = sorted(containers, key=lambda c: (-c.priority, -c.weight_kg, -c.length_ft, c.container_id))
+        # Containers already placed keep their slots: replaying a successful
+        # batch must not occupy capacity twice.
+        placed = {c.container_id: (load, c) for load in self.loads for c in load.containers}
         assignments = {}
+        pending = []
+        for container in containers:
+            if container.container_id in placed:
+                load, existing = placed[container.container_id]
+                if existing != container:
+                    raise ConflictError(f'container {container.container_id} already placed with different attributes')
+                assignments[container.container_id] = load.wagon.wagon_id
+            else:
+                pending.append(container)
+        # Plan the whole batch on a scratch copy of the loads; self.loads is
+        # only swapped in once every container has a wagon, so a failed batch
+        # leaves the current loads untouched.
+        planned = [WagonLoad(load.wagon, list(load.containers)) for load in self.loads]
+        ordered = sorted(pending, key=lambda c: (-c.priority, -c.weight_kg, -c.length_ft, c.container_id))
         for container in ordered:
-            candidates = [load for load in self.loads if load.can_add(container)]
+            candidates = [load for load in planned if load.can_add(container)]
             if not candidates:
                 raise CapacityError(f'no wagon capacity for {container.container_id}')
 
@@ -72,6 +88,7 @@ class RailBlockPlanner:
             chosen = min(candidates, key=waste)
             chosen.add(container)
             assignments[container.container_id] = chosen.wagon.wagon_id
+        self.loads = planned
         return assignments
 
     def validate_sequence(self, destination_order: list[str]) -> None:

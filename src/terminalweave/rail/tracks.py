@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from terminalweave.core.errors import ValidationError, CapacityError
+from terminalweave.core.errors import ValidationError, CapacityError, ConflictError
 
 @dataclass(frozen=True)
 class YardTrack:
@@ -26,19 +26,38 @@ class TrackAllocator:
         self.tracks = {t.track_id: t for t in tracks}
         self.occupied: dict[str, str] = {}
 
-    def allocate(self, m: TrainMovement) -> str:
-        candidates = []
-        for t in self.tracks.values():
-            if t.track_id in self.occupied or t.usable_length_m < m.length_m:
-                continue
-            if m.needs_electric and (not t.electrified):
-                continue
-            if m.needs_service and (not t.service_track):
-                continue
-            candidates.append((t.usable_length_m - m.length_m, t.track_id))
+    @staticmethod
+    def _compatible(t: YardTrack, m: TrainMovement) -> bool:
+        if t.usable_length_m < m.length_m:
+            return False
+        if m.needs_electric and (not t.electrified):
+            return False
+        if m.needs_service and (not t.service_track):
+            return False
+        return True
+
+    def find_track(self, m: TrainMovement) -> str | None:
+        candidates = [(t.usable_length_m - m.length_m, t.track_id) for t in self.tracks.values() if t.track_id not in self.occupied and self._compatible(t, m)]
         if not candidates:
+            return None
+        return min(candidates)[1]
+
+    def validate(self, m: TrainMovement) -> str:
+        """Return the track the movement would get, without occupying it."""
+        for track_id, train_id in self.occupied.items():
+            if train_id == m.train_id:
+                if not self._compatible(self.tracks[track_id], m):
+                    raise ConflictError(f'train {m.train_id} already holds incompatible track {track_id}')
+                return track_id
+        track = self.find_track(m)
+        if track is None:
             raise CapacityError('no compatible yard track')
-        _, track = min(candidates)
+        return track
+
+    def allocate(self, m: TrainMovement) -> str:
+        # Idempotent: a train that already holds a track gets the same track
+        # back instead of occupying a second one.
+        track = self.validate(m)
         self.occupied[track] = m.train_id
         return track
 
